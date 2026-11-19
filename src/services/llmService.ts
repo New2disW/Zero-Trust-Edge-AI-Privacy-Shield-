@@ -1,6 +1,7 @@
 const GROQ_CHAT_COMPLETIONS_URL =
   'https://api.groq.com/openai/v1/chat/completions';
-const DEFAULT_MODEL = 'llama-3.1-8b-instant';
+const DEFAULT_MODEL =
+  import.meta.env.VITE_GROQ_MODEL?.trim() || 'openai/gpt-oss-20b';
 const MAX_CONTEXT_CHUNKS = 15;
 
 interface GroqChatCompletionResponse {
@@ -53,7 +54,7 @@ export async function requestSecureCompletion({
     .join('\n\n');
 
   const systemPrompt = useContext
-    ? `You are a secure document analysis AI. Answer the user's query strictly using the provided context chunks and the sanitized conversation history. The context has been sanitized for privacy (e.g., names replaced with [PERSON_A]). Use these placeholders in your answer exactly as they appear if referring to them. If the answer is not present in the context or the sanitized conversation history, say you do not know based on the provided information.\n\nContext:\n${joinedChunks}`
+    ? `You are a secure document analysis AI. Answer the user's query strictly using the provided context chunks and the sanitized conversation history. The context has been sanitized for privacy (e.g., names replaced with [PERSON_1]). Use these placeholders in your answer exactly as they appear if referring to them. If the answer is not present in the context or the sanitized conversation history, say you do not know based on the provided information.\n\nContext:\n${joinedChunks}`
     : "You are a helpful, highly capable AI assistant. Answer the user's query naturally based on the sanitized conversation history. The conversation may contain privacy placeholders like [PERSON_1]. Preserve those placeholders exactly if you refer to them, and do not invent any hidden document context.";
 
   const response = await fetch(GROQ_CHAT_COMPLETIONS_URL, {
@@ -77,10 +78,18 @@ export async function requestSecureCompletion({
   });
 
   if (!response.ok) {
-    const payload = (await response.json()) as GroqChatCompletionResponse;
+    let errorMessage: string | undefined;
+    try {
+      const errorText = await response.text();
+      const payload = JSON.parse(errorText) as GroqChatCompletionResponse;
+      errorMessage = payload.error?.message;
+    } catch {
+      // Non-JSON error page (e.g., HTML 502/503)
+    }
+
     throw new Error(
-      payload.error?.message ??
-        `Groq request failed with status ${response.status}.`
+      errorMessage ??
+      `Groq request failed with status ${response.status}.`
     );
   }
 

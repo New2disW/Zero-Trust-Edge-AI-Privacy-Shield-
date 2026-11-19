@@ -19,6 +19,15 @@ import type {
 } from '@/workers/types';
 import { requestSecureCompletion } from '@/services/llmService';
 import { rehydrateResponse } from '@/utils/rehydration';
+import {
+  type PIIDefense,
+  PII_DEFENSES,
+  CHUNK_PII_DEFENSES,
+  TOKEN_PATTERN,
+  isTitleCaseEntity,
+  normalizeLedgerKey,
+  canonicalizeTokenLabel
+} from '@/utils/piiDefenses';
 
 export type DocumentAIPhase =
   | 'idle'
@@ -122,12 +131,6 @@ interface WorkerRequestHandlers<TComplete> {
   reject: (reason?: unknown) => void;
 }
 
-interface PIIDefense {
-  regex: RegExp;
-  tag: string;
-  captureGroup?: number;
-}
-
 interface PrefilteredTextRedaction {
   redactedText: string;
   dictionary: RedactionResult['dictionary'];
@@ -143,225 +146,6 @@ const DEFAULT_WORKER_STATE: DocumentAIWorkerState = {
 export const DEFAULT_SEMANTIC_THRESHOLD = 0.12;
 const META_QUERY_PATTERN =
   /\b(summarize|summary|this pdf|the pdf|this document|the document)\b/i;
-const PII_DEFENSES: PIIDefense[] = [
-  // ── Explicit Person Names (Full Name, Emergency Contact) ──
-  {
-    regex: /(?:full name|name|emergency contact|contact name|customer name)\s*[:\-]?\s*([A-Z][a-z]+(?:\s[A-Z][a-z]+)*(?:\s\d+)?)\b/gi,
-    tag: '[INPUT_PERSON]',
-    captureGroup: 1
-  },
-  // ── Bank account numbers (after keyword) ──
-  {
-    regex: /(?:(?:account|acct|a\/c)(?:\s*(?:no|number|num|#))?\s*[:\-]?\s*)(\d{8,18})\b/gi,
-    tag: '[INPUT_ACCOUNT_NUM]',
-    captureGroup: 1
-  },
-  // ── Routing / bank routing number ──
-  {
-    regex: /((?:bank\s+)?routing\s+number(?:\s*[:#-])?\s*)(\d{8,12})\b/gi,
-    tag: '[INPUT_ROUTING]',
-    captureGroup: 2
-  },
-  // ── Email ──
-  {
-    regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
-    tag: '[INPUT_EMAIL]'
-  },
-  // ── Phone numbers ──
-  {
-    regex: /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g,
-    tag: '[INPUT_PHONE]'
-  },
-  // ── Credit card ──
-  {
-    regex: /\b(?:\d{4}[-\s]?){3}\d{4}\b/g,
-    tag: '[INPUT_CC]'
-  },
-  // ── US SSN ──
-  {
-    regex: /\b\d{3}-\d{2}-\d{4}\b/g,
-    tag: '[INPUT_SSN]'
-  },
-  // ── Indian PAN ──
-  {
-    regex: /\b[A-Z]{5}\d{4}[A-Z]\b/g,
-    tag: '[INPUT_PAN]'
-  },
-  // ── Indian Aadhaar ──
-  {
-    regex: /\b\d{4}\s\d{4}\s\d{4}\b/g,
-    tag: '[INPUT_AADHAAR]'
-  },
-  // ── Passport ──
-  {
-    regex: /\b[A-Z]\d{7}\b/g,
-    tag: '[INPUT_PASSPORT]'
-  },
-  // ── IFSC ──
-  {
-    regex: /\b[A-Z]{4}0[A-Z0-9]{6}\b/g,
-    tag: '[INPUT_IFSC]'
-  },
-  // ── Date of Birth ──
-  {
-    regex: /\b(?:\d{2}[\/-]\d{2}[\/-]\d{4}|\d{4}[\/-]\d{2}[\/-]\d{2})\b/g,
-    tag: '[INPUT_DOB]'
-  },
-  // ── IP address ──
-  {
-    regex: /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g,
-    tag: '[INPUT_IP]'
-  },
-  // ── Medical / Insurance IDs ──
-  {
-    regex: /\b(?:MED|INS|HLT|HLTH|MID|HEALTH)[-]?\d{4,12}\b/gi,
-    tag: '[INPUT_MEDICAL_ID]'
-  },
-  // ── Employee IDs ──
-  {
-    regex: /\b(?:EMP|STAFF|HR|EMPID)[-]?\d{3,10}\b/gi,
-    tag: '[INPUT_EMPLOYEE_ID]'
-  },
-  // ── UPI IDs ──
-  {
-    regex: /\b[A-Za-z0-9._%+-]+@(?:upi|paytm|ybl|okhdfcbank|okaxis|okicici|apl|ibl)\b/gi,
-    tag: '[INPUT_UPI_ID]'
-  },
-  // ── Person names (contextual) ──
-  {
-    regex:
-      /(?:my name is|i am|this is|manager|boss|colleague|director|mr\.|mrs\.|ms\.|dr\.)(?:,)?\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b/gi,
-    tag: '[INPUT_PERSON]',
-    captureGroup: 1
-  },
-  // ── Location (contextual) ──
-  {
-    regex:
-      /(?:lives in|from|located in|traveling to|based in)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+)?)\b/gi,
-    tag: '[INPUT_LOCATION]',
-    captureGroup: 1
-  },
-  // ── Person names after prepositions ──
-  {
-    regex:
-      /(?:for|about|regarding)\s+([A-Z][a-z]+(?:\s[A-Z][a-z]+){1,2})\b/gi,
-    tag: '[INPUT_PERSON]',
-    captureGroup: 1
-  }
-];
-const CHUNK_PII_DEFENSES: PIIDefense[] = [
-  // ── Explicit Person Names (Full Name, Emergency Contact) ──
-  {
-    regex: /(?:full name|name|emergency contact|contact name|customer name)\s*[:\-]?\s*([A-Z][a-z]+(?:\s[A-Z][a-z]+)*(?:\s\d+)?)\b/gi,
-    tag: '[PERSON]',
-    captureGroup: 1
-  },
-  // ── Bank account numbers (after keyword) ──
-  {
-    regex: /(?:(?:account|acct|a\/c)(?:\s*(?:no|number|num|#))?\s*[:\-]?\s*)(\d{8,18})\b/gi,
-    tag: '[ACCOUNT_NUM]',
-    captureGroup: 1
-  },
-  // ── Routing / bank routing number ──
-  {
-    regex: /((?:bank\s+)?routing\s+number(?:\s*[:#-])?\s*)(\d{8,12})\b/gi,
-    tag: '[ROUTING]',
-    captureGroup: 2
-  },
-  // ── Email ──
-  {
-    regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g,
-    tag: '[EMAIL]'
-  },
-  // ── Phone numbers ──
-  {
-    regex: /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g,
-    tag: '[PHONE]'
-  },
-  // ── Credit card ──
-  {
-    regex: /\b(?:\d{4}[-\s]?){3}\d{4}\b/g,
-    tag: '[CC]'
-  },
-  // ── US SSN ──
-  {
-    regex: /\b\d{3}-\d{2}-\d{4}\b/g,
-    tag: '[SSN]'
-  },
-  // ── Indian PAN ──
-  {
-    regex: /\b[A-Z]{5}\d{4}[A-Z]\b/g,
-    tag: '[PAN]'
-  },
-  // ── Indian Aadhaar ──
-  {
-    regex: /\b\d{4}\s\d{4}\s\d{4}\b/g,
-    tag: '[AADHAAR]'
-  },
-  // ── Passport ──
-  {
-    regex: /\b[A-Z]\d{7}\b/g,
-    tag: '[PASSPORT]'
-  },
-  // ── IFSC ──
-  {
-    regex: /\b[A-Z]{4}0[A-Z0-9]{6}\b/g,
-    tag: '[IFSC]'
-  },
-  // ── Date of Birth ──
-  {
-    regex: /\b(?:\d{2}[\/-]\d{2}[\/-]\d{4}|\d{4}[\/-]\d{2}[\/-]\d{2})\b/g,
-    tag: '[DOB]'
-  },
-  // ── IP address ──
-  {
-    regex: /\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b/g,
-    tag: '[IP_ADDRESS]'
-  },
-  // ── Medical / Insurance IDs ──
-  {
-    regex: /\b(?:MED|INS|HLT|HLTH|MID|HEALTH)[-]?\d{4,12}\b/gi,
-    tag: '[MEDICAL_ID]'
-  },
-  // ── Employee IDs ──
-  {
-    regex: /\b(?:EMP|STAFF|HR|EMPID)[-]?\d{3,10}\b/gi,
-    tag: '[EMPLOYEE_ID]'
-  },
-  // ── Indian Voter ID ──
-  {
-    regex: /\b[A-Z]{3}\d{7}\b/g,
-    tag: '[VOTER_ID]'
-  },
-  // ── Indian vehicle registration ──
-  {
-    regex: /\b[A-Z]{2}\d{2}[A-Z]{1,2}\d{4}\b/g,
-    tag: '[VEHICLE_REG]'
-  },
-  // ── Driver's License ──
-  {
-    regex: /\b(?:DL|D\.?L\.?)\s*[:#-]?\s*[A-Z0-9]{6,12}\b/gi,
-    tag: '[DRIVERS_LICENSE]'
-  },
-  // ── UPI IDs ──
-  {
-    regex: /\b[A-Za-z0-9._%+-]+@(?:upi|paytm|ybl|okhdfcbank|okaxis|okicici|apl|ibl)\b/gi,
-    tag: '[UPI_ID]'
-  },
-  // ── Usernames (after keyword) ──
-  {
-    regex: /(?:username|user\s*id|login\s*id|user\s*name)\s*[:\-]?\s*([A-Za-z0-9._-]{3,30})\b/gi,
-    tag: '[USERNAME]',
-    captureGroup: 1
-  },
-  // ── Physical addresses (after keyword) ──
-  {
-    regex: /(?:address|residence|addr)\s*[:\-]?\s*(.{10,120})(?=\n|$)/gi,
-    tag: '[ADDRESS]',
-    captureGroup: 1
-  }
-];
-const TOKEN_FRAGMENT_PATTERN = /\[[A-Z0-9_]+\]/;
 const EMBEDDING_BATCH_SIZE = 20;
 const LARGE_DOCUMENT_CHUNK_THRESHOLD = 100;
 const SMALL_DOCUMENT_TOP_K = 5;
@@ -410,6 +194,8 @@ export function useDocumentAI({
   const chunker = useMemo(() => new Chunker(), []);
 
   useEffect(() => {
+    let isCancelled = false;
+
     const embeddingWorker = new Worker(
       new URL('../workers/embedding-worker.ts', import.meta.url),
       { type: 'module' }
@@ -432,10 +218,65 @@ export function useDocumentAI({
       handleNERWorkerMessage(event.data);
     };
 
+    embeddingWorker.onerror = (event: ErrorEvent) => {
+      if (isCancelled) return;
+      const message =
+        event.message || 'Embedding worker encountered an unexpected error.';
+      console.error('Embedding worker error:', event);
+
+      for (const pending of pendingEmbeddingRequestsRef.current.values()) {
+        pending.reject(new Error(message));
+      }
+      pendingEmbeddingRequestsRef.current.clear();
+
+      setError(message);
+      setPhase('error');
+    };
+
+    nerWorker.onerror = (event: ErrorEvent) => {
+      if (isCancelled) return;
+      const message =
+        event.message || 'NER worker encountered an unexpected error.';
+      console.error('NER worker error:', event);
+
+      for (const pending of pendingNERRequestsRef.current.values()) {
+        pending.reject(new Error(message));
+      }
+      pendingNERRequestsRef.current.clear();
+
+      setError(message);
+      setPhase('error');
+    };
+
     setPhase('initializing');
-    void initializeWorkers();
+
+    initializeWorkers()
+      .then(() => {
+        if (!isCancelled) {
+          setPhase('idle');
+        }
+      })
+      .catch((initError: unknown) => {
+        if (isCancelled) {
+          return;
+        }
+
+        const message =
+          initError instanceof Error
+            ? initError.message
+            : 'Worker initialization failed.';
+
+        if (message.includes('worker was terminated')) {
+          return;
+        }
+
+        console.error('Failed to initialize workers:', initError);
+        setError(message);
+        setPhase('error');
+      });
 
     return () => {
+      isCancelled = true;
       embeddingWorker.terminate();
       nerWorker.terminate();
       embeddingWorkerRef.current = null;
@@ -540,8 +381,6 @@ export function useDocumentAI({
         requestId: uuidv4()
       })
     ]);
-
-    setPhase('idle');
   };
 
   const processDocument = async (file: File): Promise<void> => {
@@ -555,6 +394,7 @@ export function useDocumentAI({
     setStreamingMessage(null);
     setPhase('processing-document');
     vectorStoreRef.current.clear();
+    resetConversationMemory();
 
     try {
       const extracted = await PDFExtractor.extract(file);
@@ -626,7 +466,13 @@ export function useDocumentAI({
         sanitizedInput,
         sanitizedInputDictionary,
         tokenDictionary: inputTokenDictionary
-      } = await sanitizeInputWithDefenses(trimmedQuery);
+      } = privacyShieldEnabled
+          ? await sanitizeInputWithDefenses(trimmedQuery)
+          : {
+            sanitizedInput: trimmedQuery,
+            sanitizedInputDictionary: {},
+            tokenDictionary: {}
+          };
       const nextPhantomHistory = [
         ...phantomHistory,
         {
@@ -645,29 +491,29 @@ export function useDocumentAI({
         metaIntentOverride
           ? META_INTENT_TOP_K
           : totalChunks > LARGE_DOCUMENT_CHUNK_THRESHOLD
-          ? LARGE_DOCUMENT_TOP_K
-          : SMALL_DOCUMENT_TOP_K;
+            ? LARGE_DOCUMENT_TOP_K
+            : SMALL_DOCUMENT_TOP_K;
       const semanticMatches =
         totalChunks > 0
           ? vectorStoreRef.current.search(
-              (await embedTexts([trimmedQuery]))[0],
-              retrievalTopK
-            )
+            (await embedTexts([trimmedQuery]))[0],
+            retrievalTopK
+          )
           : [];
       const topSemanticScore = semanticMatches[0]?.score ?? 0;
       const route: SemanticRoute =
         metaIntentOverride ||
-        (semanticMatches.length > 0 && topSemanticScore >= semanticThreshold)
+          (semanticMatches.length > 0 && topSemanticScore >= semanticThreshold)
           ? 'document'
           : 'general';
       const routeMessage =
         metaIntentOverride
           ? 'Meta-intent override detected. Using local document context for a document-level request.'
           : route === 'document'
-          ? `Using document context (${(topSemanticScore * 100).toFixed(1)}% semantic match).`
-          : semanticMatches.length === 0
-            ? 'Bypassing document index (no local document context available). Engaging general AI mode.'
-            : 'Bypassing document index (low semantic match). Engaging general AI mode.';
+            ? `Using document context (${(topSemanticScore * 100).toFixed(1)}% semantic match).`
+            : semanticMatches.length === 0
+              ? 'Bypassing document index (no local document context available). Engaging general AI mode.'
+              : 'Bypassing document index (low semantic match). Engaging general AI mode.';
       const routedMatches =
         route === 'document'
           ? semanticMatches.slice(0, retrievalTopK)
@@ -676,13 +522,13 @@ export function useDocumentAI({
       const { redactedMatches, tokenDictionary: chunkTokenDictionary } =
         route === 'document'
           ? await sanitizeDocumentChunksJIT(
-              routedMatches,
-              privacyShieldEnabled
-            )
+            routedMatches,
+            privacyShieldEnabled
+          )
           : {
-              redactedMatches: [],
-              tokenDictionary: {}
-            };
+            redactedMatches: [],
+            tokenDictionary: {}
+          };
       const tokenDictionary = {
         ...globalTokenDictionaryRef.current,
         ...inputTokenDictionary,
@@ -778,6 +624,7 @@ export function useDocumentAI({
 
   const clearDocument = (): void => {
     vectorStoreRef.current.clear();
+    resetConversationMemory();
     setDocumentName(null);
     setPageCount(0);
     setChunkCount(0);
@@ -949,16 +796,16 @@ export function useDocumentAI({
       const workerResult = workerResults[index];
       const promotedWorkerResult = workerResult
         ? promoteSanitizedText({
-            redactedText: workerResult.redactedText,
-            dictionary: workerResult.dictionary,
-            spans: workerResult.spans
-          })
+          redactedText: workerResult.redactedText,
+          dictionary: workerResult.dictionary,
+          spans: workerResult.spans
+        })
         : {
-            redactedText: prefilteredChunk.redactedText,
-            dictionary: {},
-            spans: [],
-            tokenDictionary: {}
-          };
+          redactedText: prefilteredChunk.redactedText,
+          dictionary: {},
+          spans: [],
+          tokenDictionary: {}
+        };
 
       Object.assign(tokenDictionary, prefilteredChunk.tokenDictionary);
       Object.assign(tokenDictionary, promotedWorkerResult.tokenDictionary);
@@ -1002,7 +849,11 @@ export function useDocumentAI({
             : fullMatch;
         const originalValue = capturedValue.trim();
 
-        if (!originalValue || TOKEN_FRAGMENT_PATTERN.test(originalValue)) {
+        if (
+          !originalValue ||
+          TOKEN_PATTERN.test(originalValue) ||
+          (defense.requireTitleCase && !isTitleCaseEntity(originalValue))
+        ) {
           return fullMatch;
         }
 
@@ -1092,7 +943,7 @@ export function useDocumentAI({
 
   const getOrCreateSessionToken = (label: string, original: string): string => {
     const normalizedLabel = canonicalizeTokenLabel(label);
-    const fingerprint = `${normalizedLabel}::${original}`;
+    const fingerprint = `${normalizedLabel}::${normalizeLedgerKey(original)}`;
     const existingToken = tokenRegistryRef.current.get(fingerprint);
 
     if (existingToken) {
@@ -1128,38 +979,8 @@ export function useDocumentAI({
   };
 }
 
-function combineResults(
-  matches: VectorSearchResult<DocumentChunkMetadata>[],
-  redactions: RedactionResult[]
-): RedactedSearchResult[] {
-  return matches.map((match, index) => {
-    const redaction = redactions[index];
-
-    return {
-      id: match.id,
-      score: match.score,
-      redactedText: redaction?.redactedText ?? match.text,
-      dictionary: redaction?.dictionary ?? {},
-      spans: redaction?.spans ?? [],
-      metadata: match.metadata
-    };
-  });
-}
-
-function normalizeTokenLabel(label: string): string {
-  return label
-    .trim()
-    .toUpperCase()
-    .replace(/[^A-Z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '') || 'ENTITY';
-}
-
-function canonicalizeTokenLabel(label: string): string {
-  return normalizeTokenLabel(label).replace(/^INPUT_/, '') || 'ENTITY';
-}
-
 function shouldRunNERForInput(text: string): boolean {
-  const remainder = text.replace(/\[[A-Z0-9_]+\]/g, ' ').trim();
+  const remainder = text.replace(new RegExp(TOKEN_PATTERN.source, 'g'), ' ').trim();
 
   return /[A-Za-z]{2,}/.test(remainder);
 }

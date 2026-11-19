@@ -19,8 +19,8 @@ import type {
 } from './types';
 
 const MODEL_NAME = 'Xenova/all-MiniLM-L6-v2';
-const WORKER_DEVICE: 'webgpu' | 'wasm' =
-  typeof navigator !== 'undefined' && 'gpu' in navigator ? 'webgpu' : 'wasm';
+let activeDevice: 'webgpu' | 'wasm' = 'wasm';
+
 const configureONNXEnvironment = env.backends.onnx as {
   wasm?: {
     wasmPaths?:
@@ -37,33 +37,127 @@ const createFeatureExtractionPipeline = pipeline as (
   options: {
     progress_callback?: (progress: ProgressInfo) => void;
     device: 'webgpu' | 'wasm';
+    dtype?: 'q8' | string;
   }
 ) => Promise<FeatureExtractionPipeline>;
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
-configureONNXEnvironment.wasm = configureONNXEnvironment.wasm ?? {};
-configureONNXEnvironment.wasm.wasmPaths =
-  WORKER_DEVICE === 'webgpu'
-    ? {
-        mjs: ortWasmSimdThreadedJsepMjsUrl,
-        wasm: ortWasmSimdThreadedJsepWasmUrl
+
+function isNetworkError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    return (
+      message.includes('failed to fetch') ||
+      message.includes('networkerror') ||
+      message.includes('network error') ||
+      message.includes('load failed')
+    );
+  }
+  return false;
+}
+
+interface NavigatorWithGPU {
+  gpu?: {
+    requestAdapter: () => Promise<unknown>;
+  };
+}
+
+async function detectDevice(): Promise<'webgpu' | 'wasm'> {
+  if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
+    try {
+      const gpu = (navigator as unknown as NavigatorWithGPU).gpu;
+      const adapter = await gpu?.requestAdapter();
+      if (adapter) {
+        return 'webgpu';
       }
-    : {
-        mjs: ortWasmSimdThreadedMjsUrl,
-        wasm: ortWasmSimdThreadedWasmUrl
-      };
+    } catch {
+      return 'wasm';
+    }
+  }
+  return 'wasm';
+}
+
+function setWasmPaths(device: 'webgpu' | 'wasm'): void {
+  configureONNXEnvironment.wasm = configureONNXEnvironment.wasm ?? {};
+  configureONNXEnvironment.wasm.wasmPaths =
+    device === 'webgpu'
+      ? {
+          mjs: ortWasmSimdThreadedJsepMjsUrl,
+          wasm: ortWasmSimdThreadedJsepWasmUrl
+        }
+      : {
+          mjs: ortWasmSimdThreadedMjsUrl,
+          wasm: ortWasmSimdThreadedWasmUrl
+        };
+}
 
 class EmbeddingPipelineSingleton {
   private static instance: Promise<FeatureExtractionPipeline> | null = null;
 
-  static getInstance(
+  static async getInstance(
     progress_callback?: (progress: ProgressInfo) => void
   ): Promise<FeatureExtractionPipeline> {
     if (!this.instance) {
-      this.instance = createFeatureExtractionPipeline('feature-extraction', MODEL_NAME, {
-        progress_callback,
-        device: WORKER_DEVICE
+      this.instance = (async () => {
+        const device = await detectDevice();
+        activeDevice = device;
+        setWasmPaths(activeDevice);
+
+        if (activeDevice === 'webgpu') {
+          try {
+            return await createFeatureExtractionPipeline(
+              'feature-extraction',
+              MODEL_NAME,
+              {
+                progress_callback,
+                device: 'webgpu',
+                dtype: 'q8'
+              }
+            );
+          } catch (error) {
+            if (isNetworkError(error)) {
+              throw error;
+            }
+
+            console.warn(
+              'WebGPU initialization failed for Embedding pipeline, falling back to WASM.',
+              error
+            );
+            activeDevice = 'wasm';
+            setWasmPaths('wasm');
+            try {
+              return await createFeatureExtractionPipeline(
+                'feature-extraction',
+                MODEL_NAME,
+                {
+                  progress_callback,
+                  device: 'wasm',
+                  dtype: 'q8'
+                }
+              );
+            } catch (wasmError) {
+              console.error(
+                'WASM fallback also failed for Embedding pipeline:',
+                wasmError
+              );
+              throw wasmError;
+            }
+          }
+        }
+
+        return await createFeatureExtractionPipeline(
+          'feature-extraction',
+          MODEL_NAME,
+          {
+            progress_callback,
+            device: 'wasm',
+            dtype: 'q8'
+          }
+        );
+      })().catch((err) => {
+        this.instance = null;
+        throw err;
       });
     }
 
@@ -211,7 +305,7 @@ function postStatus({
     message,
     progress,
     model: MODEL_NAME,
-    device: WORKER_DEVICE
+    device: activeDevice
   };
 
   workerScope.postMessage(response satisfies EmbeddingWorkerResponse);

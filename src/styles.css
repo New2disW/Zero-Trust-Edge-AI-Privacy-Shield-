@@ -11,23 +11,23 @@
     box-sizing: border-box;
   }
 
-  html {
-    min-height: 100%;
-    background:
-      radial-gradient(circle at top left, rgba(8, 145, 178, 0.16), transparent 30%),
-      radial-gradient(circle at top right, rgba(52, 211, 153, 0.12), transparent 24%),
-      linear-gradient(180deg, #040816 0%, #050b17 100%);
-  }
-
+  html,
   body {
-    @apply min-h-screen bg-transparent text-slate-100 antialiased;
+    height: 100%;
     margin: 0;
-    min-width: 320px;
-    font-family: "Soehne", "Avenir Next", "IBM Plex Sans", "Segoe UI", sans-serif;
+    padding: 0;
+    background-color: #070A0F;
+    color: #f1f5f9;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    overflow: hidden;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
   }
 
   #root {
-    @apply min-h-screen;
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
   }
 
   button,
@@ -37,17 +37,19 @@
   }
 
   ::selection {
-    background: rgba(125, 211, 252, 0.22);
+    background: rgba(16, 185, 129, 0.25);
+    color: #ffffff;
   }
 
+  /* Sleek Minimal Dark Scrollbars */
   * {
     scrollbar-width: thin;
-    scrollbar-color: rgba(148, 163, 184, 0.36) transparent;
+    scrollbar-color: rgba(255, 255, 255, 0.12) transparent;
   }
 
   *::-webkit-scrollbar {
-    width: 10px;
-    height: 10px;
+    width: 5px;
+    height: 5px;
   }
 
   *::-webkit-scrollbar-track {
@@ -55,35 +57,70 @@
   }
 
   *::-webkit-scrollbar-thumb {
-    border-radius: 999px;
-    border: 2px solid transparent;
-    background: rgba(148, 163, 184, 0.28);
-    background-clip: padding-box;
+    border-radius: 9999px;
+    background: rgba(255, 255, 255, 0.12);
+  }
+
+  *::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.25);
   }
 }
 
 @layer components {
-  .panel-surface {
-    @apply rounded-[28px] border border-white/10 bg-white/[0.04] shadow-panel backdrop-blur-2xl;
+  .glass-panel {
+    @apply rounded-2xl border border-white/10 bg-white/[0.03] backdrop-blur-xl;
   }
 
-  .panel-surface-muted {
-    @apply rounded-[24px] border border-white/10 bg-white/[0.03] backdrop-blur-xl;
+  .glass-card {
+    @apply rounded-xl border border-white/[0.08] bg-white/[0.02] backdrop-blur-md;
   }
 
-  .signal-pill {
-    @apply inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.05] px-3 py-1 text-[0.68rem] font-medium uppercase tracking-[0.24em] text-slate-300;
+  .ambient-glow {
+    background:
+      radial-gradient(circle at 20% 0%, rgba(16, 185, 129, 0.08) 0%, transparent 45%),
+      radial-gradient(circle at 80% 10%, rgba(6, 182, 212, 0.06) 0%, transparent 40%),
+      radial-gradient(circle at 50% 90%, rgba(16, 185, 129, 0.04) 0%, transparent 50%),
+      #070A0F;
   }
+}
 
-  .field-shell {
-    @apply rounded-[24px] border border-white/10 bg-white/[0.04] shadow-glow backdrop-blur-xl;
+@keyframes messageFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
   }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
 
-  .grid-noise {
-    background-image:
-      linear-gradient(rgba(148, 163, 184, 0.08) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(148, 163, 184, 0.08) 1px, transparent 1px);
-    background-size: 32px 32px;
-    mask-image: radial-gradient(circle at center, black 32%, transparent 88%);
+.animate-message-fade {
+  animation: messageFadeIn 0.25s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes cursorBlink {
+  0%, 100% {
+    opacity: 1;
   }
+  50% {
+    opacity: 0;
+  }
+}
+
+.animate-cursor {
+  animation: cursorBlink 0.85s infinite;
+}
+
+@keyframes pulseGlow {
+  0%, 100% {
+    box-shadow: 0 0 15px -3px rgba(16, 185, 129, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 25px 2px rgba(16, 185, 129, 0.7);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlow 2.5s ease-in-out infinite;
 }

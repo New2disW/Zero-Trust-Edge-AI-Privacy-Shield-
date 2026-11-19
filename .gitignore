@@ -1,8 +1,19 @@
+# Dependencies & builds
 node_modules
 dist
 public/wasm
 *.tsbuildinfo
-.DS_Store
-*.local
-*.example
+coverage
 
+# Environment variables (keep template, ignore all real keys)
+.env
+.env.*
+!.env.example
+*.local
+
+# Logs & OS files
+*.log
+.DS_Store
+
+# Personal local notes
+Learning_This_Damn_Project/

@@ -23,8 +23,8 @@ import type {
 } from './types';
 
 const MODEL_NAME = 'Xenova/bert-base-NER';
-const WORKER_DEVICE: 'webgpu' | 'wasm' =
-  typeof navigator !== 'undefined' && 'gpu' in navigator ? 'webgpu' : 'wasm';
+let activeDevice: 'webgpu' | 'wasm' = 'wasm';
+
 const configureONNXEnvironment = env.backends.onnx as {
   wasm?: {
     wasmPaths?:
@@ -41,33 +41,127 @@ const createTokenClassificationPipeline = pipeline as (
   options: {
     progress_callback?: (progress: ProgressInfo) => void;
     device: 'webgpu' | 'wasm';
+    dtype?: 'q8' | string;
   }
 ) => Promise<TokenClassificationPipelineType>;
 
 env.allowLocalModels = false;
 env.useBrowserCache = true;
-configureONNXEnvironment.wasm = configureONNXEnvironment.wasm ?? {};
-configureONNXEnvironment.wasm.wasmPaths =
-  WORKER_DEVICE === 'webgpu'
-    ? {
-        mjs: ortWasmSimdThreadedJsepMjsUrl,
-        wasm: ortWasmSimdThreadedJsepWasmUrl
+
+function isNetworkError(error: unknown): boolean {
+  if (error instanceof Error) {
+    const message = error.message.toLowerCase();
+    return (
+      message.includes('failed to fetch') ||
+      message.includes('networkerror') ||
+      message.includes('network error') ||
+      message.includes('load failed')
+    );
+  }
+  return false;
+}
+
+interface NavigatorWithGPU {
+  gpu?: {
+    requestAdapter: () => Promise<unknown>;
+  };
+}
+
+async function detectDevice(): Promise<'webgpu' | 'wasm'> {
+  if (typeof navigator !== 'undefined' && 'gpu' in navigator) {
+    try {
+      const gpu = (navigator as unknown as NavigatorWithGPU).gpu;
+      const adapter = await gpu?.requestAdapter();
+      if (adapter) {
+        return 'webgpu';
       }
-    : {
-        mjs: ortWasmSimdThreadedMjsUrl,
-        wasm: ortWasmSimdThreadedWasmUrl
-      };
+    } catch {
+      return 'wasm';
+    }
+  }
+  return 'wasm';
+}
+
+function setWasmPaths(device: 'webgpu' | 'wasm'): void {
+  configureONNXEnvironment.wasm = configureONNXEnvironment.wasm ?? {};
+  configureONNXEnvironment.wasm.wasmPaths =
+    device === 'webgpu'
+      ? {
+          mjs: ortWasmSimdThreadedJsepMjsUrl,
+          wasm: ortWasmSimdThreadedJsepWasmUrl
+        }
+      : {
+          mjs: ortWasmSimdThreadedMjsUrl,
+          wasm: ortWasmSimdThreadedWasmUrl
+        };
+}
 
 class NERPipelineSingleton {
   private static instance: Promise<TokenClassificationPipelineType> | null = null;
 
-  static getInstance(
+  static async getInstance(
     progress_callback?: (progress: ProgressInfo) => void
   ): Promise<TokenClassificationPipelineType> {
     if (!this.instance) {
-      this.instance = createTokenClassificationPipeline('token-classification', MODEL_NAME, {
-        progress_callback,
-        device: WORKER_DEVICE
+      this.instance = (async () => {
+        const device = await detectDevice();
+        activeDevice = device;
+        setWasmPaths(activeDevice);
+
+        if (activeDevice === 'webgpu') {
+          try {
+            return await createTokenClassificationPipeline(
+              'token-classification',
+              MODEL_NAME,
+              {
+                progress_callback,
+                device: 'webgpu',
+                dtype: 'q8'
+              }
+            );
+          } catch (error) {
+            if (isNetworkError(error)) {
+              throw error;
+            }
+
+            console.warn(
+              'WebGPU initialization failed for NER pipeline, falling back to WASM.',
+              error
+            );
+            activeDevice = 'wasm';
+            setWasmPaths('wasm');
+            try {
+              return await createTokenClassificationPipeline(
+                'token-classification',
+                MODEL_NAME,
+                {
+                  progress_callback,
+                  device: 'wasm',
+                  dtype: 'q8'
+                }
+              );
+            } catch (wasmError) {
+              console.error(
+                'WASM fallback also failed for NER pipeline:',
+                wasmError
+              );
+              throw wasmError;
+            }
+          }
+        }
+
+        return await createTokenClassificationPipeline(
+          'token-classification',
+          MODEL_NAME,
+          {
+            progress_callback,
+            device: 'wasm',
+            dtype: 'q8'
+          }
+        );
+      })().catch((err) => {
+        this.instance = null;
+        throw err;
       });
     }
 
@@ -171,12 +265,19 @@ function buildRedactionResult(
   sourceText: string,
   predictions: TokenClassificationOutput
 ): RedactionResult {
-  const spans = collapseOverlaps(aggregateEntitySpans(sourceText, predictions)).map(
-    (span) => ({
-      ...span,
-      text: sourceText.slice(span.start, span.end)
+  const aggregated = aggregateEntitySpans(sourceText, predictions);
+  const rawSpans = collapseOverlaps(aggregated, sourceText);
+  const spans = rawSpans
+    .map((span) => {
+      const trimmed = trimSpanOffsets(sourceText, span.start, span.end);
+      return {
+        ...span,
+        start: trimmed.start,
+        end: trimmed.end,
+        text: trimmed.text
+      };
     })
-  );
+    .filter((span) => span.text.length > 0);
 
   const dictionary: Record<string, RedactionDictionaryEntry> = {};
   const placeholderByEntity = new Map<string, string>();
@@ -215,12 +316,49 @@ function buildRedactionResult(
   };
 }
 
+function trimSpanOffsets(
+  sourceText: string,
+  start: number,
+  end: number
+): { start: number; end: number; text: string } {
+  let s = Math.max(0, start);
+  let e = Math.min(sourceText.length, end);
+
+  // Strip leading whitespace and delimiter/punctuation characters
+  // e.g. colons, commas, dots, dashes, slashes, quotes, brackets, parentheses
+  while (s < e && /[\s\r\n\t,;:.'"\-_/[\]()|~<>]/.test(sourceText[s])) {
+    s++;
+  }
+
+  // Strip trailing whitespace and delimiter/punctuation characters
+  while (e > s && /[\s\r\n\t,;:.'"\-_/[\]()|~<>]/.test(sourceText[e - 1])) {
+    e--;
+  }
+
+  return {
+    start: s,
+    end: e,
+    text: sourceText.slice(s, e)
+  };
+}
+
 function aggregateEntitySpans(
   sourceText: string,
   predictions: TokenClassificationOutput
 ): RedactionSpan[] {
   const spans: RedactionSpan[] = [];
   let currentSpan: RedactionSpan | null = null;
+
+  // Protect all pre-existing privacy tokens (both numeric e.g. [ACCOUNT_NUM_1] and alphabetic e.g. [PERSON_A])
+  const placeholderRegex = /\[[A-Z][A-Z0-9_]*_[A-Z0-9]+\]/g;
+  const placeholderRanges: Array<{ start: number; end: number }> = [];
+  let match: RegExpExecArray | null;
+  while ((match = placeholderRegex.exec(sourceText)) !== null) {
+    placeholderRanges.push({
+      start: match.index,
+      end: match.index + match[0].length
+    });
+  }
 
   for (const prediction of predictions) {
     if (
@@ -231,11 +369,17 @@ function aggregateEntitySpans(
       continue;
     }
 
-    const entityText = sourceText
-      .slice(prediction.start, prediction.end)
-      .trim();
+    const { start, end } = prediction;
+    const overlapsPlaceholder = placeholderRanges.some(
+      (range) => start < range.end && end > range.start
+    );
 
-    if (!entityText) {
+    if (overlapsPlaceholder) {
+      continue;
+    }
+
+    const trimmed = trimSpanOffsets(sourceText, start, end);
+    if (!trimmed.text) {
       continue;
     }
 
@@ -245,11 +389,11 @@ function aggregateEntitySpans(
     }
 
     const nextSpan: RedactionSpan = {
-      start: prediction.start,
-      end: prediction.end,
+      start: trimmed.start,
+      end: trimmed.end,
       label,
       placeholder: '',
-      text: entityText,
+      text: trimmed.text,
       score: prediction.score
     };
 
@@ -268,7 +412,10 @@ function aggregateEntitySpans(
     }
 
     currentSpan.end = Math.max(currentSpan.end, nextSpan.end);
-    currentSpan.text = sourceText.slice(currentSpan.start, currentSpan.end).trim();
+    const combined = trimSpanOffsets(sourceText, currentSpan.start, currentSpan.end);
+    currentSpan.start = combined.start;
+    currentSpan.end = combined.end;
+    currentSpan.text = combined.text;
     currentSpan.score = (currentSpan.score + nextSpan.score) / 2;
   }
 
@@ -279,7 +426,7 @@ function aggregateEntitySpans(
   return spans.filter((span) => span.text.length > 0);
 }
 
-function collapseOverlaps(spans: RedactionSpan[]): RedactionSpan[] {
+function collapseOverlaps(spans: RedactionSpan[], sourceText: string): RedactionSpan[] {
   const sortedSpans = [...spans].sort(
     (left, right) => left.start - right.start || right.end - left.end
   );
@@ -295,7 +442,10 @@ function collapseOverlaps(spans: RedactionSpan[]): RedactionSpan[] {
 
     if (previous.label === span.label) {
       previous.end = Math.max(previous.end, span.end);
-      previous.text = previous.text.length >= span.text.length ? previous.text : span.text;
+      const combined = trimSpanOffsets(sourceText, previous.start, previous.end);
+      previous.start = combined.start;
+      previous.end = combined.end;
+      previous.text = combined.text;
       previous.score = Math.max(previous.score, span.score);
       continue;
     }
@@ -390,7 +540,7 @@ function postStatus({
     message,
     progress,
     model: MODEL_NAME,
-    device: WORKER_DEVICE
+    device: activeDevice
   };
 
   workerScope.postMessage(response satisfies NERWorkerResponse);

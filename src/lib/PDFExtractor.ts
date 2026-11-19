@@ -3,9 +3,11 @@ import pdfWorkerSrc from 'pdfjs-dist/build/pdf.worker.mjs?url';
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfWorkerSrc;
 
-interface PDFTextItem {
+export interface PDFTextItem {
   str: string;
   transform: number[];
+  width?: number;
+  height?: number;
   hasEOL?: boolean;
 }
 
@@ -68,50 +70,82 @@ export class PDFExtractor {
     }
   }
 
+  static extractTextFromItems(items: unknown[]): string {
+    let result = '';
+    let prevItem: PDFTextItem | null = null;
+    let pendingEOL = false;
+
+    for (const rawItem of items) {
+      if (!this.isTextItem(rawItem)) {
+        continue;
+      }
+
+      const item = rawItem;
+      const str = item.str;
+
+      if (!str) {
+        if (item.hasEOL) {
+          pendingEOL = true;
+        }
+        continue;
+      }
+
+      if (prevItem) {
+        const prevX = prevItem.transform[4] ?? 0;
+        const prevY = prevItem.transform[5] ?? 0;
+        const prevWidth = prevItem.width ?? 0;
+        const currX = item.transform[4] ?? 0;
+        const currY = item.transform[5] ?? 0;
+
+        const isLineBreak =
+          pendingEOL ||
+          prevItem.hasEOL === true ||
+          Math.abs(currY - prevY) > 2;
+
+        if (isLineBreak) {
+          if (!result.endsWith('\n')) {
+            result += '\n';
+          }
+        } else {
+          // On the same line: Math.abs(currY - prevY) <= 2
+          const horizontalGap = prevWidth > 0 ? currX - (prevX + prevWidth) : currX - prevX;
+          const isPunctuation = /^[,.;:!?%)\]}]/.test(str);
+          const isOpenBracket = /[([/{-]$/.test(result);
+          const alreadyHasSpace =
+            result.endsWith(' ') ||
+            result.endsWith('\n') ||
+            str.startsWith(' ');
+
+          const hasGap = prevWidth > 0 ? horizontalGap > 1.5 : Math.abs(currX - prevX) > 3;
+
+          if (!alreadyHasSpace && !isPunctuation && !isOpenBracket && hasGap) {
+            result += ' ';
+          }
+        }
+      }
+
+      result += str;
+      prevItem = item;
+      pendingEOL = item.hasEOL === true;
+    }
+
+    // Normalize excessive horizontal whitespace without collapsing newlines
+    return result
+      .split('\n')
+      .map((line) => line.replace(/[^\S\r\n]+/g, ' ').trim())
+      .filter((line, index, arr) => {
+        if (line.length === 0) {
+          return index > 0 && arr[index - 1].length > 0;
+        }
+        return true;
+      })
+      .join('\n')
+      .trim();
+  }
+
   private static async extractPageText(page: PDFPageProxy): Promise<string> {
     const textContent = await page.getTextContent();
-    const lines: string[] = [];
-    let currentLine = '';
-    let currentY: number | null = null;
-
-    for (const item of textContent.items) {
-      if (!this.isTextItem(item)) {
-        continue;
-      }
-
-      const token = this.normalizeWhitespace(item.str);
-      if (!token) {
-        continue;
-      }
-
-      const itemY = item.transform[5] ?? 0;
-      const isNewLine =
-        currentY !== null && Math.abs(itemY - currentY) > 4;
-
-      if (isNewLine && currentLine) {
-        lines.push(this.finalizeLine(currentLine));
-        currentLine = '';
-      }
-
-      if (currentLine && this.shouldInsertSpace(currentLine, token)) {
-        currentLine += ' ';
-      }
-
-      currentLine += token;
-      currentY = itemY;
-
-      if (item.hasEOL && currentLine) {
-        lines.push(this.finalizeLine(currentLine));
-        currentLine = '';
-        currentY = null;
-      }
-    }
-
-    if (currentLine) {
-      lines.push(this.finalizeLine(currentLine));
-    }
-
-    return lines.join('\n').trim();
+    return this.extractTextFromItems(textContent.items);
   }
 
   private static isTextItem(item: unknown): item is PDFTextItem {
@@ -119,34 +153,10 @@ export class PDFExtractor {
       typeof item === 'object' &&
       item !== null &&
       'str' in item &&
-      typeof item.str === 'string' &&
+      typeof (item as { str: unknown }).str === 'string' &&
       'transform' in item &&
-      Array.isArray(item.transform)
+      Array.isArray((item as { transform: unknown }).transform)
     );
-  }
-
-  private static shouldInsertSpace(currentLine: string, token: string): boolean {
-    if (!currentLine) {
-      return false;
-    }
-
-    if (/[([/{-]$/.test(currentLine)) {
-      return false;
-    }
-
-    if (/^[,.;:!?%)\]}]/.test(token)) {
-      return false;
-    }
-
-    return true;
-  }
-
-  private static finalizeLine(line: string): string {
-    return line.replace(/[ \t]+/g, ' ').trim();
-  }
-
-  private static normalizeWhitespace(value: string): string {
-    return value.replace(/\s+/g, ' ').trim();
   }
 
   private static readFileAsArrayBuffer(file: File): Promise<ArrayBuffer> {

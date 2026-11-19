@@ -87,7 +87,7 @@ export class VectorStore<TMetadata = Record<string, unknown>> {
 
     return [...this.items.values()]
       .map((item) => ({
-        ...this.toPublicItem(item),
+        item,
         score: this.cosineSimilarity(
           normalizedQuery,
           queryMagnitude,
@@ -96,7 +96,11 @@ export class VectorStore<TMetadata = Record<string, unknown>> {
         )
       }))
       .sort((left, right) => right.score - left.score)
-      .slice(0, topK);
+      .slice(0, topK)
+      .map(({ item, score }) => ({
+        ...this.toPublicItem(item),
+        score
+      }));
   }
 
   clear(): void {
